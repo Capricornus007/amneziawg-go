@@ -136,11 +136,15 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	var sendBuffer [][]byte
 
+	var counterBytes [4]byte
+	rand.Read(counterBytes[:])
+	counter := binary.BigEndian.Uint32(counterBytes[:])
 	for _, ipacket := range peer.device.ipackets {
 		if ipacket != nil {
 			buf := make([]byte, ipacket.ObfuscatedLen(0))
-			ipacket.Obfuscate(buf, nil)
+			ipacket.ObfuscateWithCounter(buf, nil, counter)
 			sendBuffer = append(sendBuffer, buf)
+			counter++
 		}
 	}
 

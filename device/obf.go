@@ -11,6 +11,7 @@ type obfBuilder func(val string) (obf, error)
 var obfBuilders = map[string]obfBuilder{
 	"b":  newBytesObf,
 	"t":  newTimestampObf,
+	"c":  newCounterObf,
 	"r":  newRandObf,
 	"rc": newRandCharObf,
 	"rd": newRandDigitsObf,
@@ -96,10 +97,23 @@ func newObfChain(spec string) (*obfChain, error) {
 }
 
 func (c *obfChain) Obfuscate(dst, src []byte) {
+	c.obfuscate(dst, src, 0)
+}
+
+func (c *obfChain) ObfuscateWithCounter(dst, src []byte, counter uint32) {
+	c.obfuscate(dst, src, counter)
+}
+
+func (c *obfChain) obfuscate(dst, src []byte, counter uint32) {
 	written := 0
 	for _, o := range c.obfs {
 		obfLen := o.ObfuscatedLen(len(src))
-		o.Obfuscate(dst[written:written+obfLen], src)
+		obfDst := dst[written : written+obfLen]
+		if counterObf, ok := o.(*counterObf); ok {
+			counterObf.obfuscateCounter(obfDst, counter)
+		} else {
+			o.Obfuscate(obfDst, src)
+		}
 		written += obfLen
 	}
 }
