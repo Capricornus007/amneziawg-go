@@ -1,4 +1,4 @@
-FROM golang:1.25.12 as awg
+FROM golang:1.27.1 as awg
 COPY . /awg
 WORKDIR /awg
 RUN go mod download && \
