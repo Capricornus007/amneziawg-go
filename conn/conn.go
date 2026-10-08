@@ -9,10 +9,14 @@ package conn
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
+
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -82,6 +86,18 @@ type Endpoint interface {
 	DstToBytes() []byte  // used for mac2 cookie calculations
 	DstIP() netip.Addr
 	SrcIP() netip.Addr
+}
+
+type UDPConn interface {
+	net.PacketConn
+	SyscallConn() (syscall.RawConn, error)
+	ReadMsgUDP(b, oob []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+	WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn int, err error)
+}
+
+type LinuxPacketConn interface {
+	ReadBatch([]ipv4.Message, int) (int, error)
+	WriteBatch(ms []ipv4.Message, flags int) (n int, err error)
 }
 
 var (

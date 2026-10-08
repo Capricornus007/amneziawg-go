@@ -9,6 +9,7 @@ package conn
 
 import (
 	"runtime"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,4 +63,38 @@ func (s *StdNetBind) SetMark(mark uint32) error {
 		}
 	}
 	return nil
+}
+
+func (b *BindStream) SetMark(mark uint32) error {
+	b.closeConnections()
+
+	ctrl := b.dialer.Control
+	b.dialer.Control = func(network, address string, c syscall.RawConn) error {
+		if ctrl != nil {
+			if err := ctrl(network, address, c); err != nil {
+				return err
+			}
+		}
+
+		err := c.Control(func(fd uintptr) {
+			unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
+		})
+		return err
+	}
+
+	ctrl = b.listenConfig.Control
+	b.listenConfig.Control = func(network, address string, c syscall.RawConn) error {
+		if ctrl != nil {
+			if err := ctrl(network, address, c); err != nil {
+				return err
+			}
+		}
+
+		err := c.Control(func(fd uintptr) {
+			unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, fwmarkIoctl, int(mark))
+		})
+		return err
+	}
+
+	return b.openConnections()
 }

@@ -1,0 +1,327 @@
+package conn
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"strconv"
+	"sync"
+
+	"github.com/amnezia-vpn/amneziawg-go/conceal"
+)
+
+var (
+	_ Bind          = (*BindStream)(nil)
+	_ Framable      = (*BindStream)(nil)
+	_ Preludable    = (*BindStream)(nil)
+	_ Masqueradable = (*BindStream)(nil)
+	_ Fallbackable  = (*BindStream)(nil)
+)
+
+type streamPacketQueue struct {
+	ep  *streamEndpoint
+	buf [65535]byte
+	n   int
+}
+
+func NewBindStream() *BindStream {
+	return &BindStream{
+		streamPacketPool: sync.Pool{
+			New: func() any {
+				return new(streamPacketQueue)
+			},
+		},
+		bufferPool: sync.Pool{
+			New: func() any {
+				return make([]byte, 65535)
+			},
+		},
+	}
+}
+
+type BindStream struct {
+	queue            chan *streamPacketQueue
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	streamPacketPool sync.Pool
+	bufferPool       sync.Pool
+	dialer           net.Dialer
+	listenConfig     net.ListenConfig
+	port             uint16
+
+	framedOpts     conceal.FramedOpts
+	preludeOpts    conceal.PreludeOpts
+	masqueradeOpts conceal.MasqueradeOpts
+	fallbackPort   uint16
+}
+
+func (b *BindStream) readFaucet() ReceiveFunc {
+	return func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
+		streamPacket, ok := <-b.queue
+		if !ok {
+			return 0, net.ErrClosed
+		}
+
+		packet := streamPacket.buf[:streamPacket.n]
+
+		copy(packets[0], packet)
+		sizes[0] = streamPacket.n
+		eps[0] = streamPacket.ep
+
+		b.streamPacketPool.Put(streamPacket)
+		return 1, nil
+	}
+}
+
+func (b *BindStream) readStream(ep *streamEndpoint) {
+	defer b.wg.Done()
+
+	for {
+		sp := b.streamPacketPool.Get().(*streamPacketQueue)
+		n, err := ep.conn.Read(sp.buf[:])
+		if err != nil {
+			b.streamPacketPool.Put(sp)
+			if b.fallbackPort != 0 && errors.Is(err, conceal.ErrFormat) {
+				b.proxyStreamFallback(ep, conceal.FormatErrorData(err))
+				return
+			}
+			ep.Close()
+			return
+		}
+
+		sp.ep, sp.n = ep, n
+		b.queue <- sp
+	}
+}
+
+func (b *BindStream) accept(listener net.Listener) {
+	defer b.wg.Done()
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return
+		default:
+		}
+
+		rawConn, err := listener.Accept()
+		if err != nil {
+			// log this error somewhere
+			break
+		}
+		conn := b.upgradeConn(rawConn, nil, false)
+
+		b.wg.Add(1)
+		go b.handleAccepted(rawConn, conn)
+	}
+}
+
+func (b *BindStream) handleAccepted(rawConn, conn net.Conn) {
+	defer b.wg.Done()
+
+	ap, err := netip.ParseAddrPort(conn.RemoteAddr().String())
+	if err != nil {
+		// add logs
+	}
+
+	ep := &streamEndpoint{
+		conn:            conn,
+		rawConn:         rawConn,
+		dst:             ap,
+		outboundPrelude: false,
+	}
+
+	b.wg.Add(1)
+	go b.readStream(ep)
+
+	<-b.ctx.Done()
+	ep.Close()
+}
+
+func (b *BindStream) dial(ep *streamEndpoint) error {
+	ep.mutex.Lock()
+	defer ep.mutex.Unlock()
+
+	if ep.conn != nil {
+		return nil
+	}
+
+	rawConn, err := b.dialer.DialContext(b.ctx, "tcp", ep.DstToString())
+	if err != nil {
+		return fmt.Errorf("failed to dial context: %v", err)
+	}
+
+	ep.ResetPreludeState()
+	conn := b.upgradeConn(rawConn, ep.PreludeState(), ep.outboundPrelude)
+	ep.conn = conn
+	ep.rawConn = rawConn
+
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		<-b.ctx.Done()
+		ep.Close()
+	}()
+
+	b.wg.Add(1)
+	go b.readStream(ep)
+
+	return nil
+}
+
+func (b *BindStream) openConnections() error {
+	b.ctx, b.cancel = context.WithCancel(context.Background())
+
+	if b.port != 0 {
+		listener, err := b.listenConfig.Listen(b.ctx, "tcp", ":"+strconv.Itoa(int(b.port)))
+		if err != nil {
+			return err
+		}
+		if addr, ok := listener.Addr().(*net.TCPAddr); ok {
+			b.port = uint16(addr.Port)
+		}
+
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			<-b.ctx.Done()
+			listener.Close()
+		}()
+
+		b.wg.Add(1)
+		go b.accept(listener)
+	}
+
+	return nil
+}
+
+func (b *BindStream) Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err error) {
+	b.queue = make(chan *streamPacketQueue, 1024)
+	b.port = port
+
+	err = b.openConnections()
+	return []ReceiveFunc{b.readFaucet()}, b.port, err
+}
+
+func (b *BindStream) Send(bufs [][]byte, ep Endpoint) error {
+	streamEp, ok := ep.(*streamEndpoint)
+	if !ok {
+		return nil
+	}
+
+	select {
+	case <-b.ctx.Done():
+		return io.ErrClosedPipe
+	default:
+	}
+
+	if err := b.dial(streamEp); err != nil {
+		return err
+	}
+
+	for _, buf := range bufs {
+		if _, err := streamEp.conn.Write(buf); err != nil {
+			streamEp.Close()
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (b *BindStream) closeConnections() {
+	if b.cancel != nil {
+		b.cancel()
+	}
+	b.wg.Wait()
+}
+
+func (b *BindStream) Close() error {
+	b.closeConnections()
+
+	if b.queue != nil {
+		close(b.queue)
+	}
+
+	return nil
+}
+
+func (b *BindStream) ParseEndpoint(s string) (Endpoint, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", s)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve addr: %v", err)
+	}
+
+	return &streamEndpoint{
+		dst:             tcpAddr.AddrPort(),
+		outboundPrelude: true,
+	}, nil
+}
+
+func (b *BindStream) BatchSize() int {
+	return 1
+}
+
+var _ Endpoint = (*streamEndpoint)(nil)
+
+type streamEndpoint struct {
+	conn    net.Conn
+	rawConn net.Conn
+
+	dst             netip.AddrPort
+	prelude         conceal.PreludeState
+	outboundPrelude bool
+	mutex           sync.Mutex
+}
+
+func (e *streamEndpoint) Close() {
+	e.mutex.Lock()
+	defer e.mutex.Unlock()
+
+	if e.conn != nil {
+		e.conn.Close()
+		e.conn = nil
+	}
+	if e.rawConn != nil {
+		e.rawConn.Close()
+		e.rawConn = nil
+	}
+	e.ResetPreludeState()
+}
+
+func (e *streamEndpoint) DstToString() string {
+	return e.dst.String()
+}
+
+func (e *streamEndpoint) DstToBytes() []byte {
+	b, _ := e.dst.MarshalBinary()
+	return b
+}
+
+func (e *streamEndpoint) DstIP() netip.Addr {
+	return e.dst.Addr()
+}
+
+func (e *streamEndpoint) ClearSrc() {
+	e.ResetPreludeState()
+}
+
+func (e *streamEndpoint) PreludeState() *conceal.PreludeState {
+	return &e.prelude
+}
+
+func (e *streamEndpoint) ResetPreludeState() {
+	e.prelude.Reset()
+}
+
+func (e *streamEndpoint) SrcToString() string {
+	return ""
+}
+
+func (e *streamEndpoint) SrcIP() netip.Addr {
+	return netip.Addr{}
+}

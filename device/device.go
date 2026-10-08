@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/conceal"
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/ratelimiter"
 	"github.com/amnezia-vpn/amneziawg-go/v3/rwcancel"
@@ -39,11 +40,16 @@ type Device struct {
 	net struct {
 		stopping sync.WaitGroup
 		sync.RWMutex
-		bind          conn.Bind // bind interface
-		netlinkCancel *rwcancel.RWCancel
-		port          uint16 // listening port
-		fwmark        uint32 // mark value (0 = disabled)
-		brokenRoaming bool
+		bind           conn.Bind // bind interface
+		netlinkCancel  *rwcancel.RWCancel
+		port           uint16 // listening port
+		fwmark         uint32 // mark value (0 = disabled)
+		brokenRoaming  bool
+		network        string
+		framedOpts     conceal.FramedOpts
+		preludeOpts    conceal.PreludeOpts
+		masqueradeOpts conceal.MasqueradeOpts
+		fallbackPort   uint16
 	}
 
 	staticIdentity struct {
@@ -89,27 +95,13 @@ type Device struct {
 	closed   chan struct{}
 	log      *Logger
 
-	junk struct {
-		min   atomic.Uint32
-		max   atomic.Uint32
-		count atomic.Uint32
-	}
-
-	headers struct {
-		init      AtomicUintRange
-		cookie    AtomicUintRange
-		response  AtomicUintRange
-		transport AtomicUintRange
-	}
-
-	paddings struct {
-		init      atomic.Uint32
-		response  atomic.Uint32
-		cookie    atomic.Uint32
-		transport atomic.Uint32
-	}
-
-	ipackets [5]*obfChain
+	// AWG 3.1 extras that have no counterpart in the conceal pipeline.
+	//
+	// Packet framing (S1-S4 padding, H1-H4 headers, i1-i5 decoys, junk) lives on
+	// device.net.framedOpts / preludeOpts / masqueradeOpts and is applied by the
+	// conn layer. The two fields below are the config source for framing stages
+	// that the experimental line does not know about; they are mirrored into
+	// framedOpts by device.applyConcealExtras() whenever UAPI changes them.
 
 	headerProtection struct {
 		sync.RWMutex
@@ -126,8 +118,11 @@ type Device struct {
 		maxHandshakeAttemps AtomicUintRange
 	}
 
-	randomTrailers atomic.Bool
 	disableCookies atomic.Bool
+
+	// randomTrailers mirrors framedOpts.RandomTrailers: the device sizes the
+	// trailer against the peer UDP window, the conceal layer tolerates it.
+	randomTrailers atomic.Bool
 }
 
 // deviceState represents the state of a Device.
@@ -322,8 +317,6 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 }
 
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
-	var rang UintRange
-
 	device := new(Device)
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
@@ -340,14 +333,9 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.rate.limiter.Init()
 	device.indexTable.Init()
 
-	rang.FromUint32(MessageInitiationType, MessageInitiationType)
-	device.headers.init.Store(rang)
-	rang.FromUint32(MessageResponseType, MessageResponseType)
-	device.headers.response.Store(rang)
-	rang.FromUint32(MessageCookieReplyType, MessageCookieReplyType)
-	device.headers.cookie.Store(rang)
-	rang.FromUint32(MessageTransportType, MessageTransportType)
-	device.headers.transport.Store(rang)
+	device.net.network = "udp"
+	device.net.framedOpts.HeaderCompat = true
+	device.net.preludeOpts.ResendInterval = conceal.DefaultPreludeResendInterval
 
 	device.PopulatePools()
 
@@ -539,6 +527,30 @@ func (device *Device) BindUpdate() error {
 	var err error
 	var recvFns []conn.ReceiveFunc
 	netc := &device.net
+
+	underlying := netc.bind
+	if multi, ok := netc.bind.(*conn.Multibind); ok {
+		if err := multi.SelectNetwork(netc.network); err != nil {
+			return err
+		}
+		underlying = multi.Bind
+	}
+
+	if framable, ok := underlying.(conn.Framable); ok {
+		framable.SetFramedOpts(netc.framedOpts)
+	}
+
+	if preludable, ok := underlying.(conn.Preludable); ok {
+		preludable.SetPreludeOpts(netc.preludeOpts)
+	}
+
+	if masqueradable, ok := underlying.(conn.Masqueradable); ok {
+		masqueradable.SetMasqueradeOpts(netc.masqueradeOpts)
+	}
+
+	if fallbackable, ok := underlying.(conn.Fallbackable); ok {
+		fallbackable.SetFallbackPort(netc.fallbackPort)
+	}
 
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
 	if err != nil {

@@ -16,12 +16,17 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/amnezia-vpn/amneziawg-go/conceal"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
 var (
-	_ Bind = (*StdNetBind)(nil)
+	_ Bind          = (*StdNetBind)(nil)
+	_ Framable      = (*StdNetBind)(nil)
+	_ Preludable    = (*StdNetBind)(nil)
+	_ Masqueradable = (*StdNetBind)(nil)
+	_ Fallbackable  = (*StdNetBind)(nil)
 )
 
 // StdNetBind implements Bind for all platforms. While Windows has its own Bind
@@ -31,10 +36,10 @@ var (
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
 	mu            sync.Mutex // protects all fields except as specified
-	ipv4          *net.UDPConn
-	ipv6          *net.UDPConn
-	ipv4PC        *ipv4.PacketConn // will be nil on non-Linux
-	ipv6PC        *ipv6.PacketConn // will be nil on non-Linux
+	ipv4          UDPConn
+	ipv6          UDPConn
+	ipv4PC        LinuxPacketConn // will be nil on non-Linux
+	ipv6PC        LinuxPacketConn // will be nil on non-Linux
 	ipv4TxOffload bool
 	ipv4RxOffload bool
 	ipv6TxOffload bool
@@ -43,9 +48,15 @@ type StdNetBind struct {
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
 	msgsPool    sync.Pool
+	bufPool     sync.Pool
 
 	blackhole4 bool
 	blackhole6 bool
+
+	framedOpts     conceal.FramedOpts
+	preludeOpts    conceal.PreludeOpts
+	masqueradeOpts conceal.MasqueradeOpts
+	fallbackPort   uint16
 }
 
 func NewStdNetBind() Bind {
@@ -70,6 +81,12 @@ func NewStdNetBind() Bind {
 				return &msgs
 			},
 		},
+
+		bufPool: sync.Pool{
+			New: func() any {
+				return make([]byte, 65535)
+			},
+		},
 	}
 }
 
@@ -79,7 +96,8 @@ type StdNetEndpoint struct {
 	// src is the current sticky source address and interface index, if
 	// supported. Typically this is a PKTINFO structure from/for control
 	// messages, see unix.PKTINFO for an example.
-	src []byte
+	src     []byte
+	prelude conceal.PreludeState
 }
 
 var (
@@ -102,6 +120,15 @@ func (e *StdNetEndpoint) ClearSrc() {
 		// Truncate src, no need to reallocate.
 		e.src = e.src[:0]
 	}
+	e.ResetPreludeState()
+}
+
+func (e *StdNetEndpoint) PreludeState() *conceal.PreludeState {
+	return &e.prelude
+}
+
+func (e *StdNetEndpoint) ResetPreludeState() {
+	e.prelude.Reset()
 }
 
 func (e *StdNetEndpoint) DstIP() netip.Addr {
@@ -152,9 +179,9 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	// If uport is 0, we can retry on failure.
 again:
 	port := int(uport)
-	var v4conn, v6conn *net.UDPConn
-	var v4pc *ipv4.PacketConn
-	var v6pc *ipv6.PacketConn
+	var v4conn, v6conn UDPConn
+	var v4pc LinuxPacketConn
+	var v6pc LinuxPacketConn
 
 	v4conn, port, err = listenNet("udp4", port)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
@@ -177,8 +204,10 @@ again:
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
+			v4pc = s.upgradePacketConn(v4pc)
 			s.ipv4PC = v4pc
 		}
+		v4conn = s.upgradeUDPConn(v4conn)
 		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
 		s.ipv4 = v4conn
 	}
@@ -186,8 +215,10 @@ again:
 		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v6pc = ipv6.NewPacketConn(v6conn)
+			v6pc = s.upgradePacketConn(v6pc)
 			s.ipv6PC = v6pc
 		}
+		v6conn = s.upgradeUDPConn(v6conn)
 		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
 		s.ipv6 = v6conn
 	}
@@ -225,20 +256,21 @@ type batchWriter interface {
 
 func (s *StdNetBind) receiveIP(
 	br batchReader,
-	conn *net.UDPConn,
+	conn UDPConn,
 	rxOffload bool,
 	bufs [][]byte,
 	sizes []int,
 	eps []Endpoint,
 ) (n int, err error) {
 	msgs := s.getMessages()
-	for i := range bufs {
-		(*msgs)[i].Buffers[0] = bufs[i]
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
-	}
 	defer s.putMessages(msgs)
+
 	var numMsgs int
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		for i := range bufs {
+			(*msgs)[i].Buffers[0] = bufs[i]
+			(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
+		}
 		if rxOffload {
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
 			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
@@ -257,6 +289,8 @@ func (s *StdNetBind) receiveIP(
 		}
 	} else {
 		msg := &(*msgs)[0]
+		msg.Buffers[0] = bufs[0]
+		msg.OOB = msg.OOB[:cap(msg.OOB)]
 		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
 		if err != nil {
 			return 0, err
@@ -277,13 +311,13 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
-func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
+func (s *StdNetBind) makeReceiveIPv4(pc LinuxPacketConn, conn UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
 
-func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
+func (s *StdNetBind) makeReceiveIPv6(pc LinuxPacketConn, conn UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
@@ -304,11 +338,17 @@ func (s *StdNetBind) Close() error {
 
 	var err1, err2 error
 	if s.ipv4 != nil {
+		if closer, ok := s.ipv4PC.(fallbackSessionCloser); ok {
+			closer.closeFallbackSessions()
+		}
 		err1 = s.ipv4.Close()
 		s.ipv4 = nil
 		s.ipv4PC = nil
 	}
 	if s.ipv6 != nil {
+		if closer, ok := s.ipv6PC.(fallbackSessionCloser); ok {
+			closer.closeFallbackSessions()
+		}
 		err2 = s.ipv6.Close()
 		s.ipv6 = nil
 		s.ipv6PC = nil
@@ -409,7 +449,7 @@ retry:
 	return err
 }
 
-func (s *StdNetBind) send(conn *net.UDPConn, pc batchWriter, msgs []ipv6.Message) error {
+func (s *StdNetBind) send(conn UDPConn, pc batchWriter, msgs []ipv6.Message) error {
 	var (
 		n     int
 		err   error

@@ -23,6 +23,7 @@ type DeviceConfig struct {
 	Jc                     int          `yaml:"jc,omitempty"`
 	Jmin                   int          `yaml:"jmin,omitempty"`
 	Jmax                   int          `yaml:"jmax,omitempty"`
+	PreludeResendInterval  *int         `yaml:"prelude_resend_interval,omitempty"`
 	S1                     int          `yaml:"s1,omitempty"`
 	S2                     int          `yaml:"s2,omitempty"`
 	S3                     int          `yaml:"s3,omitempty"`
@@ -45,6 +46,7 @@ type DeviceConfig struct {
 	MaxHandshakeAttempts   string       `yaml:"max_handshake_attempts,omitempty"`
 	RandomTrailers         string       `yaml:"random_trailers,omitempty"`
 	DisableCookies         string       `yaml:"disable_cookies,omitempty"`
+	FallbackPort           int          `yaml:"fallback_port,omitempty"`
 	Peers                  []PeerConfig `yaml:"peers,omitempty"`
 }
 
@@ -92,6 +94,10 @@ func genIpcString(cfg *DeviceConfig) (string, error) {
 	if cfg.Jmax != 0 {
 		b.WriteString("\njmax=")
 		b.WriteString(strconv.Itoa(cfg.Jmax))
+	}
+	if cfg.PreludeResendInterval != nil {
+		b.WriteString("\nprelude_resend_interval=")
+		b.WriteString(strconv.Itoa(*cfg.PreludeResendInterval))
 	}
 	if cfg.S1 != 0 {
 		b.WriteString("\ns1=")
@@ -180,6 +186,10 @@ func genIpcString(cfg *DeviceConfig) (string, error) {
 	if cfg.DisableCookies != "" {
 		b.WriteString("\ndisable_cookies=")
 		b.WriteString(cfg.DisableCookies)
+	}
+	if cfg.FallbackPort != 0 {
+		b.WriteString("\nfallback_port=")
+		b.WriteString(strconv.Itoa(cfg.FallbackPort))
 	}
 
 	for _, peer := range cfg.Peers {

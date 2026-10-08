@@ -48,13 +48,11 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer      *[MaxMessageSize]byte // slice holding the packet data
-	packet      []byte                // slice of "buffer" (always!)
-	nonce       uint64                // nonce for encryption
-	keypair     *Keypair              // keypair for encryption
-	peer        *Peer                 // related peer
-	padding     uint32
-	isKeepalive bool
+	buffer  *[MaxMessageSize]byte // slice holding the packet data
+	packet  []byte                // slice of "buffer" (always!)
+	nonce   uint64                // nonce for encryption
+	keypair *Keypair              // keypair for encryption
+	peer    *Peer                 // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -66,8 +64,6 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
 	elem.nonce = 0
-	elem.padding = device.paddings.transport.Load()
-	elem.isKeepalive = false
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
 }
@@ -88,7 +84,6 @@ func (elem *QueueOutboundElement) clearPointers() {
 func (peer *Peer) SendKeepalive() {
 	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
 		elem := peer.device.NewOutboundElement()
-		elem.isKeepalive = true
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
 		select {
@@ -134,31 +129,12 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	var sendBuffer [][]byte
-
-	var counterBytes [4]byte
-	rand.Read(counterBytes[:])
-	counter := binary.BigEndian.Uint32(counterBytes[:])
-	for _, ipacket := range peer.device.ipackets {
-		if ipacket != nil {
-			buf := make([]byte, ipacket.ObfuscatedLen(0))
-			ipacket.ObfuscateWithCounter(buf, nil, counter)
-			sendBuffer = append(sendBuffer, buf)
-			counter++
-		}
-	}
-
-	sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
-
-	padding := int(peer.device.paddings.init.Load())
-	trailerLen := max(peer.randomTrailer(padding+MessageInitiationSize), 0)
-
-	buf := make([]byte, padding+MessageInitiationSize+trailerLen)
-
-	crypt := buf[:padding]
-	rand.Read(crypt)
-
-	writer := bytes.NewBuffer(buf[padding:padding])
+	// Decoy packets (i1-i5), junk (jc/jmin/jmax) and the S1-S4 padding prefix are
+	// no longer built here: the conceal pipeline in the conn layer emits them and
+	// applies header protection on the way out. Only the AWG 3.1 random trailer
+	// stays, because its bound is the per-peer UDP receive window.
+	var buf [MessageInitiationSize]byte
+	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, msg)
 	packet := writer.Bytes()
 	peer.cookieGenerator.AddMacs(packet)
@@ -166,19 +142,9 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	cip, err := peer.device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
-	if err != nil {
-		return err
-	}
-	if cip != nil {
-		cip.XORKeyStream(packet, packet)
-	}
+	packet = appendRandomTrailer(peer, packet, MessageInitiationSize)
 
-	trailer := buf[padding+MessageInitiationSize:]
-	rand.Read(trailer)
-
-	sendBuffer = append(sendBuffer, buf)
-	err = peer.SendBuffers(sendBuffer)
+	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
@@ -200,15 +166,8 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	padding := int(peer.device.paddings.response.Load())
-	trailerLen := max(peer.randomTrailer(padding+MessageResponseSize), 0)
-
-	buf := make([]byte, padding+MessageResponseSize+trailerLen)
-
-	crypt := buf[:padding]
-	rand.Read(crypt)
-
-	writer := bytes.NewBuffer(buf[padding:padding])
+	var buf [MessageResponseSize]byte
+	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, response)
 	packet := writer.Bytes()
 	peer.cookieGenerator.AddMacs(packet)
@@ -223,19 +182,10 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
-	cip, err := peer.device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
-	if err != nil {
-		return err
-	}
-	if cip != nil {
-		cip.XORKeyStream(packet, packet)
-	}
-
-	trailer := buf[padding+MessageResponseSize:]
-	rand.Read(trailer)
+	packet = appendRandomTrailer(peer, packet, MessageResponseSize)
 
 	// TODO: allocation could be avoided
-	err = peer.SendBuffers([][]byte{buf})
+	err = peer.SendBuffers([][]byte{packet})
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake response: %v", peer, err)
 	}
@@ -245,45 +195,34 @@ func (peer *Peer) SendHandshakeResponse() error {
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
 	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
 
-	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	msgType := device.headers.cookie.Load().PickOne()
+	opts := &device.net.framedOpts
+	var typ uint32
+	if opts.HeaderCompat && opts.H3 != nil {
+		typ = opts.H3.Generate()
+	} else {
+		typ = MessageCookieReplyType
+	}
 
-	reply, err := device.cookieChecker.CreateReply(
-		initiatingElem.packet,
-		sender,
-		initiatingElem.endpoint.DstToBytes(),
-		msgType,
-	)
+	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
+	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes(), typ)
 	if err != nil {
 		device.log.Errorf("Failed to create cookie reply: %v", err)
 		return err
 	}
 
-	padding := int(device.paddings.cookie.Load())
-	trailerLen := max(device.randomTrailer(padding+MessageCookieReplySize), 0)
-
-	buf := make([]byte, padding+MessageCookieReplySize+trailerLen)
-
-	crypt := buf[:padding]
-	rand.Read(crypt)
-
-	writer := bytes.NewBuffer(buf[padding:padding])
+	var buf [MessageCookieReplySize]byte
+	writer := bytes.NewBuffer(buf[:0])
 	binary.Write(writer, binary.LittleEndian, reply)
 	packet := writer.Bytes()
 
-	cip, err := device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
-	if err != nil {
-		return err
+	if trailerLen := max(device.randomTrailer(MessageCookieReplySize), 0); trailerLen > 0 {
+		trailer := make([]byte, trailerLen)
+		rand.Read(trailer)
+		packet = append(packet, trailer...)
 	}
-	if cip != nil {
-		cip.XORKeyStream(packet, packet)
-	}
-
-	trailer := buf[padding+MessageCookieReplySize:]
-	rand.Read(trailer)
 
 	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{buf}, initiatingElem.endpoint)
+	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
 	return nil
 }
 
@@ -332,8 +271,9 @@ func (device *Device) RoutineReadFromTUN() {
 	}()
 
 	for {
-		padding := device.paddings.transport.Load()
-		offset := MessageTransportHeaderSize + int(padding)
+		// The S4 framing padding is prepended by the conceal layer, so the TUN
+		// reader only has to leave the transport header in front.
+		offset := MessageTransportHeaderSize
 
 		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
@@ -344,7 +284,6 @@ func (device *Device) RoutineReadFromTUN() {
 
 			elem := elems[i]
 			elem.packet = bufs[i][offset : offset+sizes[i]]
-			elem.padding = padding
 
 			// lookup peer
 			var peer *Peer
@@ -572,6 +511,33 @@ func (peer *Peer) randomTrailer(packetSize int) int {
 	return int(fastrandn(uint32(udpWindow - packetSize)))
 }
 
+// framingPaddingSize reports how many padding bytes the conceal layer puts in
+// front of a transport record, so the UDP receive window accounting stays
+// truthful now that the device no longer prepends it itself.
+func (device *Device) framingPaddingSize() int {
+	return device.net.framedOpts.S4
+}
+
+// appendRandomTrailer implements the AWG 3.1 random trailer for handshake
+// messages. Its length is bounded by the peer UDP receive window, which only the
+// device knows; the conceal framing layer recognises the trailer by record size
+// and drops it again on the way in.
+func appendRandomTrailer(peer *Peer, packet []byte, messageSize int) []byte {
+	trailerLen := max(peer.randomTrailer(messageSize), 0)
+	if trailerLen == 0 {
+		return packet
+	}
+
+	out := make([]byte, 0, messageSize+trailerLen)
+	out = append(out, packet[:messageSize]...)
+
+	trailer := make([]byte, trailerLen)
+	rand.Read(trailer)
+	out = append(out, trailer...)
+
+	return out
+}
+
 /* Encrypts the elements in the queue
  * and marks them for sequential consumption (by releasing the mutex)
  *
@@ -585,27 +551,34 @@ func (device *Device) RoutineEncryption(id int) {
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			udpWindow := elem.padding + MinMessageSize + uint32(len(elem.packet))
-			if elem.peer.udpWindow.Load() < udpWindow {
-				elem.peer.udpWindow.Store(udpWindow)
-			}
-
-			// fill crypto padding
-			crypt := elem.buffer[:elem.padding]
-			rand.Read(crypt)
-
 			// populate header fields
-			header := elem.buffer[elem.padding : elem.padding+MessageTransportHeaderSize]
+			header := elem.buffer[:MessageTransportHeaderSize]
 
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
 			fieldNonce := header[8:16]
 
-			binary.LittleEndian.PutUint32(fieldType, device.headers.transport.Load().PickOne())
+			opts := &device.net.framedOpts
+			var typ uint32
+			if opts.HeaderCompat && opts.H4 != nil {
+				typ = opts.H4.Generate()
+			} else {
+				typ = MessageTransportType
+			}
+
+			binary.LittleEndian.PutUint32(fieldType, typ)
 			binary.LittleEndian.PutUint32(fieldReceiver, elem.keypair.remoteIndex)
 			binary.LittleEndian.PutUint64(fieldNonce, elem.nonce)
 
-			packetSize := len(elem.packet) + MinMessageSize + int(elem.padding)
+			// AWG 3.1: keep tracking the peer UDP receive window, including the
+			// framing padding the conn layer is going to put in front of this
+			// record, and use spare room for the configured content padding.
+			packetSize := MinMessageSize + len(elem.packet) + device.framingPaddingSize()
+			udpWindow := uint32(packetSize)
+			if elem.peer.udpWindow.Load() < udpWindow {
+				elem.peer.udpWindow.Store(udpWindow)
+			}
+
 			mtu := int(device.tun.mtu.Load())
 
 			paddingSize := elem.peer.randomPaddingAddition(packetSize)
@@ -627,21 +600,11 @@ func (device *Device) RoutineEncryption(id int) {
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
 			elem.packet = elem.keypair.send.Seal(
-				elem.buffer[:elem.padding+MessageTransportHeaderSize],
+				header,
 				nonce[:],
 				elem.packet,
 				nil,
 			)
-
-			cip, err := device.HeaderProtectionCipher(crypt[:HeaderCipherNonceSize])
-			if err != nil {
-				device.log.Errorf("Routing: header obfuscation failed - packet dropped")
-				elem.packet = nil
-				continue
-			}
-			if cip != nil {
-				cip.XORKeyStream(header, header)
-			}
 		}
 		elemsContainer.Unlock()
 	}
@@ -680,7 +643,7 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		dataSent := false
 		elemsContainer.Lock()
 		for _, elem := range elemsContainer.elems {
-			if !elem.isKeepalive {
+			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
 			}
 
@@ -694,7 +657,6 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		if dataSent {
 			peer.timersDataSent()
 		}
-
 		for _, elem := range elemsContainer.elems {
 			device.PutMessageBuffer(elem.buffer)
 			device.PutOutboundElement(elem)

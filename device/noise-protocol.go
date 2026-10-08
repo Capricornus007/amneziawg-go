@@ -6,7 +6,6 @@
 package device
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"sync"
@@ -55,11 +54,10 @@ const (
 )
 
 const (
-	MessageUnknownType     uint32 = 0
-	MessageInitiationType  uint32 = 1
-	MessageResponseType    uint32 = 2
-	MessageCookieReplyType uint32 = 3
-	MessageTransportType   uint32 = 4
+	MessageInitiationType  = 1
+	MessageResponseType    = 2
+	MessageCookieReplyType = 3
+	MessageTransportType   = 4
 )
 
 const (
@@ -196,10 +194,16 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
 
 	handshake.mixHash(handshake.remoteStatic[:])
 
-	msgType := device.headers.init.Load().PickOne()
+	opts := &device.net.framedOpts
+	var typ uint32
+	if opts.HeaderCompat && opts.H1 != nil {
+		typ = opts.H1.Generate()
+	} else {
+		typ = MessageInitiationType
+	}
 
 	msg := MessageInitiation{
-		Type:      msgType,
+		Type:      typ,
 		Ephemeral: handshake.localEphemeral.publicKey(),
 	}
 
@@ -255,8 +259,15 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
 		chainKey [blake2s.Size]byte
 	)
 
-	if msg.Type != MessageInitiationType {
-		return nil
+	opts := &device.net.framedOpts
+	if opts.HeaderCompat && opts.H1 != nil {
+		if !opts.H1.Validate(msg.Type) {
+			return nil
+		}
+	} else {
+		if msg.Type != MessageInitiationType {
+			return nil
+		}
 	}
 
 	device.staticIdentity.RLock()
@@ -371,8 +382,16 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 		return nil, err
 	}
 
+	opts := &device.net.framedOpts
+	var typ uint32
+	if opts.HeaderCompat && opts.H2 != nil {
+		typ = opts.H2.Generate()
+	} else {
+		typ = MessageResponseType
+	}
+
 	var msg MessageResponse
-	msg.Type = device.headers.response.Load().PickOne()
+	msg.Type = typ
 	msg.Sender = handshake.localIndex
 	msg.Receiver = handshake.remoteIndex
 
@@ -422,8 +441,15 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
 }
 
 func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
-	if msg.Type != MessageResponseType {
-		return nil
+	opts := &device.net.framedOpts
+	if opts.HeaderCompat && opts.H2 != nil {
+		if !opts.H2.Validate(msg.Type) {
+			return nil
+		}
+	} else {
+		if msg.Type != MessageResponseType {
+			return nil
+		}
 	}
 
 	// lookup handshake by receiver
@@ -627,21 +653,6 @@ func (peer *Peer) ReceivedWithKeypair(receivedKeypair *Keypair) bool {
 	keypairs.current = keypairs.next.Load()
 	keypairs.next.Store(nil)
 	return true
-}
-
-func (device *Device) JunkPackets() [][]byte {
-	var bufs [][]byte
-
-	min := device.junk.min.Load()
-	max := device.junk.max.Load()
-
-	for range device.junk.count.Load() {
-		buf := make([]byte, min+fastrandn(max-min))
-		rand.Read(buf)
-		bufs = append(bufs, buf)
-	}
-
-	return bufs
 }
 
 func (device *Device) HeaderProtectionCipher(salt []byte) (*chacha20.Cipher, error) {
