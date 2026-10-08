@@ -6,7 +6,17 @@ import (
 	"net"
 	"sync"
 
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/net/ipv4"
+)
+
+// AWG 3.1 header protection (formerly applied inside the device layer).
+// The keystream is ChaCha20 keyed by the header protection key, with the nonce
+// taken from the first HeaderProtectionNonceSize bytes of the per-message
+// padding prefix that the frame encoder generates.
+const (
+	HeaderProtectionKeySize   = 32
+	HeaderProtectionNonceSize = 12
 )
 
 type FramedOpts struct {
@@ -19,6 +29,11 @@ type FramedOpts struct {
 	S3           int
 	S4           int
 	HeaderCompat bool
+
+	// AWG 3.1 extras carried over from the device-side implementation.
+	HeaderProtectionKey [HeaderProtectionKeySize]byte
+	HasHeaderProtection bool
+	RandomTrailers      bool
 }
 
 func (o *FramedOpts) HasIntersections() bool {
@@ -96,8 +111,27 @@ func newFrameEncoding(opts FramedOpts) (e frameEncoding, ok bool) {
 		ok = true
 	}
 
+	// Header protection needs a padding prefix to derive its nonce from, so it
+	// only makes sense together with S1-S4. Enabling it still turns the framing
+	// stage on even when no header/padding was configured, so the config is
+	// never silently ignored.
+	if opts.HasHeaderProtection && !isZeroKey(opts.HeaderProtectionKey) {
+		e.hpKey = opts.HeaderProtectionKey
+		e.hasHP = true
+		ok = true
+	}
+
+	if opts.RandomTrailers {
+		e.trailers = true
+	}
+
 	e.compat = opts.HeaderCompat
 	return e, ok
+}
+
+func isZeroKey(key [HeaderProtectionKeySize]byte) bool {
+	var zero [HeaderProtectionKeySize]byte
+	return key == zero
 }
 
 type frameEncoding struct {
@@ -113,7 +147,10 @@ type frameEncoding struct {
 		cookie    int
 		transport int
 	}
-	compat bool
+	compat   bool
+	hpKey    [HeaderProtectionKeySize]byte
+	hasHP    bool
+	trailers bool
 }
 
 type frameRecordKind uint8
@@ -126,20 +163,94 @@ const (
 	frameRecordTransport
 )
 
-func encodeOne(dst, src []byte, header RangedHeader, padding int) int {
-	rand.Read(dst[:padding])
-	dst = dst[padding:]
-
-	binary.LittleEndian.PutUint32(dst[:4], header.Generate())
-	dst = dst[4:]
-
-	n := copy(dst, src[4:])
-	return padding + 4 + n
+// messageSize returns the on-wire size of the WireGuard message the given kind
+// carries, excluding padding and random trailers.
+func (k frameRecordKind) messageSize() int {
+	switch k {
+	case frameRecordInitiation:
+		return WireguardMsgInitiationSize
+	case frameRecordResponse:
+		return WireguardMsgResponseSize
+	case frameRecordCookie:
+		return WireguardMsgCookieReplySize
+	case frameRecordTransport:
+		return WireguardMsgTransportHeaderSize
+	}
+	return 0
 }
 
-func encodeOneCompat(dst, src []byte, padding int) int {
+func paddingOf(e *frameEncoding, kind frameRecordKind) int {
+	switch kind {
+	case frameRecordInitiation:
+		return e.padding.initial
+	case frameRecordResponse:
+		return e.padding.response
+	case frameRecordCookie:
+		return e.padding.cookie
+	case frameRecordTransport:
+		return e.padding.transport
+	}
+	return 0
+}
+
+func headerOf(e *frameEncoding, kind frameRecordKind) RangedHeader {
+	switch kind {
+	case frameRecordInitiation:
+		return e.header.initial
+	case frameRecordResponse:
+		return e.header.response
+	case frameRecordCookie:
+		return e.header.cookie
+	case frameRecordTransport:
+		return e.header.transport
+	}
+	return RangedHeader{}
+}
+
+// applyHeaderProtection runs the AWG 3.1 keystream over the covered part of the
+// message body. body must start right after the padding prefix (i.e. at the
+// message type field) and nonce must be the padding prefix itself.
+func (e *frameEncoding) applyHeaderProtection(nonce []byte, body []byte, kind frameRecordKind) bool {
+	if !e.hasHP {
+		return true
+	}
+	if len(nonce) < HeaderProtectionNonceSize || len(body) < kind.messageSize() {
+		return false
+	}
+	cip, err := chacha20.NewUnauthenticatedCipher(e.hpKey[:], nonce[:HeaderProtectionNonceSize])
+	if err != nil {
+		return false
+	}
+	cip.XORKeyStream(body[:kind.messageSize()], body[:kind.messageSize()])
+	return true
+}
+
+// encodeOne builds one framed record. When replaceHeader is set the message type
+// field is swapped for a value generated from the configured header range
+// (non-compat framing); otherwise the source is copied as-is (compat framing,
+// where the device already picked the header value). A random trailer appended
+// by the device travels untouched through the keystream-covered region.
+func (e *frameEncoding) encodeOne(dst, src []byte, kind frameRecordKind, replaceHeader bool) int {
+	padding := paddingOf(e, kind)
+	if len(dst) < padding+len(src) || len(src) < 4 {
+		return 0
+	}
+
 	rand.Read(dst[:padding])
-	n := copy(dst[padding:], src)
+
+	body := dst[padding:]
+	var n int
+	if replaceHeader {
+		header := headerOf(e, kind)
+		binary.LittleEndian.PutUint32(body[:4], header.Generate())
+		n = 4 + copy(body[4:], src[4:])
+	} else {
+		n = copy(body, src)
+	}
+
+	if !e.applyHeaderProtection(dst[:padding], body[:n], kind) {
+		return 0
+	}
 	return padding + n
 }
 
@@ -151,80 +262,120 @@ func (e *frameEncoding) Encode(dst, src []byte) int {
 	header := binary.LittleEndian.Uint32(src[:4])
 
 	if e.compat {
-		if e.header.initial.Validate(header) {
-			return encodeOneCompat(dst, src, e.padding.initial)
-		} else if e.header.response.Validate(header) {
-			return encodeOneCompat(dst, src, e.padding.response)
-		} else if e.header.cookie.Validate(header) {
-			return encodeOneCompat(dst, src, e.padding.cookie)
-		} else if e.header.transport.Validate(header) {
-			return encodeOneCompat(dst, src, e.padding.transport)
+		switch {
+		case e.header.initial.Validate(header):
+			return e.encodeOne(dst, src, frameRecordInitiation, false)
+		case e.header.response.Validate(header):
+			return e.encodeOne(dst, src, frameRecordResponse, false)
+		case e.header.cookie.Validate(header):
+			return e.encodeOne(dst, src, frameRecordCookie, false)
+		case e.header.transport.Validate(header):
+			return e.encodeOne(dst, src, frameRecordTransport, false)
 		}
 	} else {
 		switch src[0] {
 		case WireguardMsgInitiationType:
-			return encodeOne(dst, src, e.header.initial, e.padding.initial)
+			return e.encodeOne(dst, src, frameRecordInitiation, true)
 		case WireguardMsgResponseType:
-			return encodeOne(dst, src, e.header.response, e.padding.response)
+			return e.encodeOne(dst, src, frameRecordResponse, true)
 		case WireguardMsgCookieReplyType:
-			return encodeOne(dst, src, e.header.cookie, e.padding.cookie)
+			return e.encodeOne(dst, src, frameRecordCookie, true)
 		case WireguardMsgTransportType:
-			return encodeOne(dst, src, e.header.transport, e.padding.transport)
+			return e.encodeOne(dst, src, frameRecordTransport, true)
 		}
 	}
 
 	return 0
 }
 
-func decodeOneCompat(b []byte, header RangedHeader, padding int) int {
-	bb := b[padding:]
-	if !header.Validate(binary.LittleEndian.Uint32(bb[:4])) {
+// validateHeader checks the (possibly header-protected) message type field
+// without touching the packet.
+func (e *frameEncoding) validateHeader(nonce []byte, typeField []byte, header RangedHeader) bool {
+	if len(typeField) < 4 {
+		return false
+	}
+	if !e.hasHP {
+		return header.Validate(binary.LittleEndian.Uint32(typeField))
+	}
+	if len(nonce) < HeaderProtectionNonceSize {
+		return false
+	}
+	cip, err := chacha20.NewUnauthenticatedCipher(e.hpKey[:], nonce[:HeaderProtectionNonceSize])
+	if err != nil {
+		return false
+	}
+	var plain [4]byte
+	cip.XORKeyStream(plain[:], typeField[:4])
+	return header.Validate(binary.LittleEndian.Uint32(plain[:]))
+}
+
+// decodeOne strips padding and the random trailer, running the header
+// protection keystream backwards on the way.
+func (e *frameEncoding) decodeOne(b []byte, kind frameRecordKind, originalHeader uint32) int {
+	padding := paddingOf(e, kind)
+	messageSize := kind.messageSize()
+	if len(b) < padding+4 {
 		return 0
 	}
 
-	return copy(b, bb)
-}
+	body := b[padding:]
+	if kind != frameRecordTransport && len(body) > messageSize {
+		if !e.trailers {
+			return 0
+		}
+		body = body[:messageSize]
+	}
 
-func decodeOne(b []byte, header RangedHeader, padding int, originalHeader uint32) int {
-	bb := b[padding:]
-	if !header.Validate(binary.LittleEndian.Uint32(bb[:4])) {
+	if !e.applyHeaderProtection(b[:padding], body, kind) {
 		return 0
+	}
+
+	if e.compat {
+		return copy(b, body)
 	}
 
 	binary.LittleEndian.PutUint32(b[:4], originalHeader)
-	n := copy(b[4:], bb[4:])
+	n := copy(b[4:], body[4:])
 
 	return 4 + n
 }
 
-func (e *frameEncoding) matchesRecord(b []byte, header RangedHeader, padding, size int) bool {
-	if len(b) != size {
+func (e *frameEncoding) recordSize(kind frameRecordKind) int {
+	return paddingOf(e, kind) + kind.messageSize()
+}
+
+func (e *frameEncoding) matchesRecord(b []byte, kind frameRecordKind) bool {
+	size := e.recordSize(kind)
+	padding := paddingOf(e, kind)
+
+	if len(b) != size && !(e.trailers && len(b) > size) {
 		return false
 	}
 	if len(b) < padding+4 {
 		return false
 	}
-	return header.Validate(binary.LittleEndian.Uint32(b[padding : padding+4]))
+	return e.validateHeader(b[:padding], b[padding:padding+4], headerOf(e, kind))
 }
 
 func (e *frameEncoding) matchesTransportRecord(b []byte) bool {
-	if len(b) < WireguardMsgTransportMinSize+e.padding.transport {
+	padding := e.padding.transport
+	if len(b) < WireguardMsgTransportMinSize+padding {
 		return false
 	}
-	if len(b) < e.padding.transport+4 {
+	if len(b) < padding+4 {
 		return false
 	}
-	return e.header.transport.Validate(binary.LittleEndian.Uint32(b[e.padding.transport : e.padding.transport+4]))
+	return e.validateHeader(b[:padding], b[padding:padding+4], e.header.transport)
 }
 
 func (e *frameEncoding) recordKind(b []byte) frameRecordKind {
-	if e.matchesRecord(b, e.header.initial, e.padding.initial, WireguardMsgInitiationSize+e.padding.initial) {
+	if e.matchesRecord(b, frameRecordInitiation) {
 		return frameRecordInitiation
 	}
-	if e.matchesRecord(b, e.header.response, e.padding.response, WireguardMsgResponseSize+e.padding.response) {
+	if e.matchesRecord(b, frameRecordResponse) {
 		return frameRecordResponse
 	}
-	if e.matchesRecord(b, e.header.cookie, e.padding.cookie, WireguardMsgCookieReplySize+e.padding.cookie) {
+	if e.matchesRecord(b, frameRecordCookie) {
 		return frameRecordCookie
 	}
 	if e.matchesTransportRecord(b) {
@@ -242,27 +393,15 @@ func (e *frameEncoding) IsInitiationRecord(b []byte) bool {
 }
 
 func (e *frameEncoding) Decode(b []byte) (int, error) {
-	switch e.recordKind(b) {
+	switch kind := e.recordKind(b); kind {
 	case frameRecordInitiation:
-		if e.compat {
-			return decodeOneCompat(b, e.header.initial, e.padding.initial), nil
-		}
-		return decodeOne(b, e.header.initial, e.padding.initial, WireguardMsgInitiationType), nil
+		return e.decodeOne(b, kind, WireguardMsgInitiationType), nil
 	case frameRecordResponse:
-		if e.compat {
-			return decodeOneCompat(b, e.header.response, e.padding.response), nil
-		}
-		return decodeOne(b, e.header.response, e.padding.response, WireguardMsgResponseType), nil
+		return e.decodeOne(b, kind, WireguardMsgResponseType), nil
 	case frameRecordCookie:
-		if e.compat {
-			return decodeOneCompat(b, e.header.cookie, e.padding.cookie), nil
-		}
-		return decodeOne(b, e.header.cookie, e.padding.cookie, WireguardMsgCookieReplyType), nil
+		return e.decodeOne(b, kind, WireguardMsgCookieReplyType), nil
 	case frameRecordTransport:
-		if e.compat {
-			return decodeOneCompat(b, e.header.transport, e.padding.transport), nil
-		}
-		return decodeOne(b, e.header.transport, e.padding.transport, WireguardMsgTransportType), nil
+		return e.decodeOne(b, kind, WireguardMsgTransportType), nil
 	default:
 		return 0, NewFormatError(b, errInvalidData)
 	}

@@ -140,6 +140,7 @@ func (p *UDPDatagramPipeline) EmitPrelude(emit func([]byte) error) error {
 		FlexBuffer: WrapFlexBuffer(nil),
 		BufferPool: p.pool,
 	}
+	seedDecoyCounter(&ctx)
 	w := newSliceWriter(buf)
 
 	for _, rules := range p.rulesArr {
@@ -151,6 +152,7 @@ func (p *UDPDatagramPipeline) EmitPrelude(emit func([]byte) error) error {
 		if err := rules.Write(&w, &ctx); err != nil {
 			return err
 		}
+		ctx.Counter++
 
 		if err := emit(w.Bytes()); err != nil {
 			return err

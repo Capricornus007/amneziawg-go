@@ -141,6 +141,7 @@ func (c *PreludeUDPConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn 
 			FlexBuffer: WrapFlexBuffer(nil),
 			BufferPool: c.pool,
 		}
+		seedDecoyCounter(&ctx)
 		w := newSliceWriter(buf)
 
 		for _, rules := range c.rulesArr {
@@ -154,6 +155,7 @@ func (c *PreludeUDPConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oobn 
 				state.Reset()
 				return 0, 0, err
 			}
+			ctx.Counter++
 
 			if _, _, err = c.origin.WriteMsgUDP(w.Bytes(), oob, addr); err != nil {
 				c.pool.Put(buf)
@@ -265,6 +267,7 @@ func (c *PreludeConn) writePreludeRecords() (err error) {
 		FlexBuffer: WrapFlexBuffer(nil),
 		BufferPool: c.pool,
 	}
+	seedDecoyCounter(&ctx)
 	w := newSliceWriter(buf)
 
 	for _, rules := range c.rulesArr {
@@ -277,6 +280,7 @@ func (c *PreludeConn) writePreludeRecords() (err error) {
 			c.pool.Put(buf)
 			return err
 		}
+		ctx.Counter++
 
 		if _, err = c.StreamRecordConn.WriteRecord(w.Bytes()); err != nil {
 			c.pool.Put(buf)
@@ -340,6 +344,7 @@ func (c *PreludeBatchConn) WriteBatch(ms []ipv4.Message, flags int) (n int, err 
 			FlexBuffer: WrapFlexBuffer(nil),
 			BufferPool: c.bufPool,
 		}
+		seedDecoyCounter(&ctx)
 
 		msgs := c.msgsPool.Get().(*[]ipv4.Message)
 		count := c.junkCount
@@ -374,6 +379,7 @@ func (c *PreludeBatchConn) WriteBatch(ms []ipv4.Message, flags int) (n int, err 
 				state.Reset()
 				return 0, err
 			}
+			ctx.Counter++
 
 			(*msgs)[i].Buffers[0] = w.Bytes()
 			(*msgs)[i].OOB = preludeMsg.OOB

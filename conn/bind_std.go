@@ -16,7 +16,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/amnezia-vpn/amneziawg-go/conceal"
+	"github.com/amnezia-vpn/amneziawg-go/v3/conceal"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )

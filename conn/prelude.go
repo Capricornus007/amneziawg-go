@@ -1,6 +1,6 @@
 package conn
 
-import "github.com/amnezia-vpn/amneziawg-go/conceal"
+import "github.com/amnezia-vpn/amneziawg-go/v3/conceal"
 
 type PreludeEndpoint interface {
 	Endpoint

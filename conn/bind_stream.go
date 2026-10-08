@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/amnezia-vpn/amneziawg-go/conceal"
+	"github.com/amnezia-vpn/amneziawg-go/v3/conceal"
 )
 
 var (

@@ -3,6 +3,7 @@ package conceal
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -32,6 +33,11 @@ func (ctx *readContext) rememberRead(b []byte) {
 type writeContext struct {
 	FlexBuffer
 	*BufferPool
+
+	// Counter backs the AWG <c> tag. The writer seeds it with a random value
+	// once per decoy group and bumps it after every decoy, which reproduces the
+	// packet counter the device-side implementation used to embed.
+	Counter uint32
 }
 
 type Rule interface {
@@ -334,7 +340,21 @@ func buildDataSizeRule(val string) (Rule, error) {
 	)
 
 	parts := strings.Fields(val)
-	if len(parts) != 2 {
+	switch len(parts) {
+	case 1:
+		// Legacy AWG spelling: "<dz 4>" means a 4-byte big-endian size field,
+		// which the newer "<dz be 4>" form says explicitly. Kept working so old
+		// configs do not silently lose their framing.
+		if length, err = strconv.Atoi(parts[0]); err != nil {
+			return nil, err
+		}
+		return &dataSizeRule{
+			length: length,
+			format: NumFormatBE,
+			end:    end,
+		}, nil
+	case 2:
+	default:
 		return nil, errors.New("wrong amount of arguments")
 	}
 
@@ -532,4 +552,114 @@ func (r *dataRule) Read(rd io.Reader, ctx *readContext) error {
 	n, err := io.ReadFull(rd, buf)
 	ctx.rememberRead(buf[:n])
 	return err
+}
+
+// buildCounterRule implements the AWG <c> tag: a 4-byte big-endian packet
+// counter. The value comes from writeContext.Counter, which the decoy writer
+// seeds randomly per message and increments per decoy packet, matching the
+// device-side AWG 3.x behaviour this rule was ported from.
+func buildCounterRule(_ string) (Rule, error) {
+	return &counterRule{}, nil
+}
+
+type counterRule struct{}
+
+func (r *counterRule) Spec() string {
+	return "<c>"
+}
+
+func (r *counterRule) Write(w io.Writer, ctx *writeContext) error {
+	tmp := ctx.Get()
+	defer ctx.Put(tmp)
+
+	binary.BigEndian.PutUint32(tmp[:4], ctx.Counter)
+	_, err := w.Write(tmp[:4])
+	return err
+}
+
+func (r *counterRule) Read(rd io.Reader, ctx *readContext) error {
+	tmp := ctx.Get()
+	defer ctx.Put(tmp)
+
+	buf := tmp[:4]
+	n, err := io.ReadFull(rd, buf)
+	ctx.rememberRead(buf[:n])
+	if err != nil {
+		return err
+	}
+
+	// The counter carries no payload; it is only checked for presence, exactly
+	// like the device-side obfuscator it replaces.
+	return nil
+}
+
+// buildDataStringRule implements the AWG <ds> tag: the payload written as an
+// unpadded base64 string. It pairs with <dz>, which states the raw size.
+func buildDataStringRule(val string) (Rule, error) {
+	return &dataStringRule{}, nil
+}
+
+type dataStringRule struct{}
+
+func (r *dataStringRule) Spec() string {
+	return "<ds>"
+}
+
+func (r *dataStringRule) Write(w io.Writer, ctx *writeContext) error {
+	buf := ctx.PullHead(-1)
+	if buf == nil {
+		return io.ErrShortBuffer
+	}
+
+	tmp := ctx.Get()
+	defer ctx.Put(tmp)
+
+	encoded := base64.RawStdEncoding.EncodeToString(buf)
+	if len(encoded) > len(tmp) {
+		return io.ErrShortBuffer
+	}
+
+	_, err := w.Write([]byte(encoded))
+	return err
+}
+
+func (r *dataStringRule) Read(rd io.Reader, ctx *readContext) error {
+	if ctx.nextDataSize <= 0 {
+		return errInvalidData
+	}
+
+	raw := ctx.PushTail(ctx.nextDataSize)
+	if raw == nil {
+		return errInvalidData
+	}
+
+	tmp := ctx.Get()
+	defer ctx.Put(tmp)
+
+	encodedLen := base64.RawStdEncoding.EncodedLen(ctx.nextDataSize)
+	if encodedLen > len(tmp) {
+		return errInvalidData
+	}
+
+	buf := tmp[:encodedLen]
+	n, err := io.ReadFull(rd, buf)
+	ctx.rememberRead(buf[:n])
+	if err != nil {
+		return err
+	}
+
+	if _, err := base64.RawStdEncoding.Decode(raw, buf); err != nil {
+		return fmt.Errorf("%w: %v", errInvalidData, err)
+	}
+
+	return nil
+}
+
+// seedDecoyCounter gives one decoy group a fresh random <c> base value, the way
+// the device-side AWG implementation did for every handshake message. The
+// emitter then bumps the counter once per decoy packet it writes.
+func seedDecoyCounter(ctx *writeContext) {
+	var seed [4]byte
+	rand.Read(seed[:])
+	ctx.Counter = binary.BigEndian.Uint32(seed[:])
 }

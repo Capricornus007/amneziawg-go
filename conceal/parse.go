@@ -16,6 +16,10 @@ var ruleBuilders = map[string]ruleBuilder{
 	"t":  buildTimestampRule,
 	"dz": buildDataSizeRule,
 	"d":  buildDataRule,
+	// Carried over from the device-side AWG obfuscators: <c> embeds the packet
+	// counter, <ds> writes the payload as an unpadded base64 string.
+	"c":  buildCounterRule,
+	"ds": buildDataStringRule,
 }
 
 func ParseRules(spec string) (Rules, error) {

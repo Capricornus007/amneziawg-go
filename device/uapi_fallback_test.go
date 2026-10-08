@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/amnezia-vpn/amneziawg-go/conn/bindtest"
-	"github.com/amnezia-vpn/amneziawg-go/tun/tuntest"
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn/bindtest"
+	"github.com/amnezia-vpn/amneziawg-go/v3/tun/tuntest"
 )
 
 func TestDeviceFallbackPortUAPI(t *testing.T) {
