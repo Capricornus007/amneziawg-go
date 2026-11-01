@@ -34,8 +34,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Resolve the golang/go master tip
+        # Dockerfile 的 builder 吃這顆（用戶 2026-10-11：「必須看到結果運行的包含最
+        # 尖端」）；沒傳 GO_TIP_SHA 的話 Dockerfile 會直接紅，不會靜默用發布版。
+        id: tip
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote https://github.com/golang/go master | cut -f1)"
+          test -n "$sha" || { echo "::error::解析 golang/go master 的 commit 失敗"; exit 1; }
+          echo ">> Go 尖端 = $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Build
         uses: docker/build-push-action@v7
         with:
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
+          build-args: |
+            GO_TIP_SHA=${{ steps.tip.outputs.sha }}
