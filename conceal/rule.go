@@ -19,6 +19,20 @@ var (
 	errInvalidData = errors.New("invalid data")
 )
 
+// parseRuleLen parses the length argument of <r>/<rc>/<rd>/<dz>. A negative
+// length flows into make([]byte, n) / buf[:n] on the next rule write and would
+// panic the daemon, so refuse it at config parse time like upstream does.
+func parseRuleLen(val string) (int, error) {
+	length, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, err
+	}
+	if length < 0 {
+		return 0, fmt.Errorf("length must not be negative, got %d", length)
+	}
+	return length, nil
+}
+
 type readContext struct {
 	FlexBuffer
 	*BufferPool
@@ -150,7 +164,7 @@ func (r *bytesRule) Read(rd io.Reader, ctx *readContext) error {
 }
 
 func buildRandRule(val string) (Rule, error) {
-	length, err := strconv.Atoi(val)
+	length, err := parseRuleLen(val)
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +208,7 @@ func (r *randRule) Read(rd io.Reader, ctx *readContext) error {
 }
 
 func buildRandDigitsRule(val string) (Rule, error) {
-	length, err := strconv.Atoi(val)
+	length, err := parseRuleLen(val)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +261,7 @@ func (r *randDigitRule) Read(rd io.Reader, ctx *readContext) error {
 }
 
 func buildRandCharRule(val string) (Rule, error) {
-	length, err := strconv.Atoi(val)
+	length, err := parseRuleLen(val)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +359,7 @@ func buildDataSizeRule(val string) (Rule, error) {
 		// Legacy AWG spelling: "<dz 4>" means a 4-byte big-endian size field,
 		// which the newer "<dz be 4>" form says explicitly. Kept working so old
 		// configs do not silently lose their framing.
-		if length, err = strconv.Atoi(parts[0]); err != nil {
+		if length, err = parseRuleLen(parts[0]); err != nil {
 			return nil, err
 		}
 		return &dataSizeRule{
@@ -378,7 +392,7 @@ func buildDataSizeRule(val string) (Rule, error) {
 
 		end = bytes[0]
 	default:
-		if length, err = strconv.Atoi(parts[1]); err != nil {
+		if length, err = parseRuleLen(parts[1]); err != nil {
 			return nil, err
 		}
 	}
