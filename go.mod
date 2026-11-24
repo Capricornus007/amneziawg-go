@@ -7,9 +7,9 @@ require (
 	go.uber.org/atomic v1.11.0
 	golang.getoutline.org/sdk v0.0.23
 	golang.getoutline.org/sdk/x v0.2.0
-	golang.org/x/crypto v0.58.0
-	golang.org/x/net v0.61.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/crypto v0.59.1-0.20261123192653-4dc4fb521066
+	golang.org/x/net v0.63.1-0.20261119175338-fd4c9ad54137
+	golang.org/x/sys v0.50.1-0.20261120131340-d4690d67735d
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2
 	gvisor.dev/gvisor v0.0.0-20231202080848-1f7806d17489
 )
@@ -24,11 +24,11 @@ require (
 	github.com/quic-go/quic-go v0.48.1 // indirect
 	github.com/shadowsocks/go-shadowsocks2 v0.1.5 // indirect
 	go.uber.org/mock v0.6.0 // indirect
-	golang.org/x/exp v0.0.0-20240506185415-9bf2ced13842 // indirect
+	golang.org/x/exp v0.0.0-20261124000051-d6646c509b6d // indirect
 	golang.org/x/mobile v0.0.0-20261011034528-197770444867 // indirect
-	golang.org/x/mod v0.42.0 // indirect
-	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/mod v0.43.1-0.20261112161916-2b553c8b61bf // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/text v0.44.1-0.20261117190556-9e7a977af666 // indirect
 	golang.org/x/time v0.16.0 // indirect
-	golang.org/x/tools v0.52.0 // indirect
+	golang.org/x/tools v0.53.1-0.20261123215244-e10a8136e8de // indirect
 )
